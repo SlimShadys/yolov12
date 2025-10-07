@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import PConv, Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -21,6 +21,7 @@ __all__ = (
     "C3",
     "C2f",
     "C2fAttn",
+    "EMCA",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
@@ -188,6 +189,49 @@ class SPPF(nn.Module):
         y.extend(self.m(y[-1]) for _ in range(3))
         return self.cv2(torch.cat(y, 1))
 
+class EMCA(nn.Module):
+    def __init__(self, c1, gamma=2, b=1):
+        super(EMCA, self).__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.map = nn.AdaptiveMaxPool2d(1)
+        
+        # Adaptive kernel size selection according to equation (8)
+        k = self._get_kernel_size(c1, gamma, b)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def _get_kernel_size(self, channels, gamma=2, b=1):
+        """Calculate adaptive kernel size according to equation (8)"""
+        import math
+        k = int((math.log2(channels) / gamma + b / gamma))
+        # Ensure k is odd
+        k = k if k % 2 == 1 else k + 1
+        # Ensure minimum kernel size of 3
+        return max(3, k)
+
+    def forward(self, x):
+        # Step 1: Global pooling and feature fusion (equations 4, 5, 6)
+        avg = self.gap(x)  # Global average pooling
+        max_pool = self.map(x)  # Global max pooling
+
+        # Feature fusion: Z_Pool = AvgPool(x) + MaxPool(x)
+        z_pool = avg + max_pool  # Shape: [b, c, 1, 1]
+
+        # Step 2: Cross-channel interaction (equation 7)
+        # Reshape for 1D convolution: [b, c, 1, 1] -> [b, 1, c]
+        z_pool = z_pool.squeeze(-1).transpose(-1, -2)  # Shape: [b, 1, c]
+
+        # Apply 1D convolution followed by sigmoid activation
+        omega = self.sigmoid(self.conv(z_pool))  # Channel attention weights
+
+        # Reshape back to match input dimensions: [b, 1, c] -> [b, c, 1, 1]
+        omega = omega.transpose(-1, -2).unsqueeze(-1)  # Shape: [b, c, 1, 1]
+
+        # Step 3: Feature recalibration (equation 9)
+        # Y = ω ⊙ X (element-wise multiplication)
+        out = x * omega.expand_as(x)
+
+        return out
 
 class C1(nn.Module):
     """CSP Bottleneck with 1 convolution."""
@@ -246,6 +290,39 @@ class C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+class C2f_Faster(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """
+        Initialize a CSP bottleneck with 2 convolutions.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(FasterBlock(self.c, self.c, shortcut, g, k=((3, 3), (1, 1), (1, 1)), e=1.0) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2f_Faster layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split() instead of chunk()."""
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
 
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
@@ -331,6 +408,33 @@ class GhostBottleneck(nn.Module):
         """Applies skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
+class FasterBlock(nn.Module):
+    """FasterBlock bottleneck."""
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        """
+        Initialize a FasterBlock module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.pconv = PConv(c1, c1, k[0], 1, padding=None, dilation=1, groups=1, bias=True)
+        self.cv1 = Conv(c1, c_, k[1], 1)
+        self.cv2 = Conv(c_, c2, k[2], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bottleneck with optional shortcut connection."""
+        return x + self.cv2(self.cv1(self.pconv(x))) if self.add else self.cv2(self.cv1(x))
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""

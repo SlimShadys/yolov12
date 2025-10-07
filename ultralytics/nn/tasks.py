@@ -29,6 +29,8 @@ from ultralytics.nn.modules import (
     Bottleneck,
     BottleneckCSP,
     C2f,
+    C2f_Faster,
+    EMCA,
     C2fAttn,
     C2fCIB,
     C2fPSA,
@@ -38,6 +40,7 @@ from ultralytics.nn.modules import (
     CBFuse,
     CBLinear,
     Classify,
+    ConcatBiFPN,
     Concat,
     Conv,
     Conv2,
@@ -979,6 +982,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C1,
             C2,
             C2f,
+            C2f_Faster,
             C3k2,
             RepNCSPELAN4,
             ELAN1,
@@ -1013,6 +1017,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C1,
                 C2,
                 C2f,
+                C2f_Faster,
                 C3k2,
                 C2fAttn,
                 C3,
@@ -1037,6 +1042,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                     args.append(1.5)
                 if scale in "nsmlx":  # for all sizes
                     args.append(True)
+        elif m is EMCA:
+            # Special handling for EMCA: only needs input channels, gamma, and b
+            c1 = ch[f]  # input channels from previous layer
+            c2 = c1     # output channels same as input channels
+            args = [c1, *args]  # args becomes [c1, gamma, b]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in {HGStem, HGBlock}:
@@ -1049,7 +1059,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[1] if args[3] else args[1] * 4
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
-        elif m is Concat:
+        elif m in [Concat, ConcatBiFPN]:
             c2 = sum(ch[x] for x in f)
         elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])

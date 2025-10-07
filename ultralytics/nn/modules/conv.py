@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 __all__ = (
+    "PConv",
     "Conv",
     "Conv2",
     "LightConv",
@@ -19,11 +20,33 @@ __all__ = (
     "ChannelAttention",
     "SpatialAttention",
     "CBAM",
+    "ConcatBiFPN",
     "Concat",
     "RepConv",
     "Index",
 )
 
+def weights_init(init_type='gaussian'):
+    def init_fun(m):
+        classname = m.__class__.__name__
+        if (classname.find('Conv') == 0 or classname.find(
+                'Linear') == 0) and hasattr(m, 'weight'):
+            if init_type == 'gaussian':
+                nn.init.normal_(m.weight, 0.0, 0.02)
+            elif init_type == 'xavier':
+                nn.init.xavier_normal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'kaiming':
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+            elif init_type == 'default':
+                pass
+            else:
+                assert 0, "Unsupported initialization: {}".format(init_type)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+    return init_fun
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
     """Pad to 'same' shape outputs."""
@@ -80,6 +103,77 @@ class Conv2(Conv):
         self.__delattr__("cv2")
         self.forward = self.forward_fuse
 
+class PConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, 
+                 padding=None, dilation=1, groups=1, bias=True):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        
+        # Handle padding calculation for both int and tuple kernel_size
+        if padding is None:
+            if isinstance(kernel_size, int):
+                self.padding = kernel_size // 2
+            else:  # kernel_size is tuple
+                self.padding = tuple(k // 2 for k in kernel_size)
+        else:
+            self.padding = padding
+    
+        # Main convolution
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, 
+                             stride, self.padding, dilation, groups, bias=False)
+        
+        # Mask convolution (fixed weights, not trainable)
+        self.mask_conv = nn.Conv2d(1, 1, kernel_size, stride, self.padding, 
+                                  dilation, 1, bias=False)
+        
+        # Initialize mask conv with ones (not trainable)
+        nn.init.constant_(self.mask_conv.weight, 1.0)
+        self.mask_conv.weight.requires_grad = False
+        
+        # Bias parameter (separate from conv bias for proper masking)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        # Initialize main conv
+        nn.init.normal_(self.conv.weight, 0.0, 0.02)
+
+    def forward(self, x):
+        batch_size, _, h, w = x.shape
+        
+        # Create initial mask (all ones)
+        mask = torch.ones(batch_size, 1, h, w, device=x.device, dtype=x.dtype)
+        
+        # Apply mask convolution to get update mask
+        update_mask = self.mask_conv(mask)
+        
+        # Calculate slide window size for mask ratio
+        if isinstance(self.kernel_size, int):
+            slide_window = self.kernel_size * self.kernel_size
+        else:  # kernel_size is tuple
+            slide_window = self.kernel_size[0] * self.kernel_size[1]
+        
+        mask_ratio = slide_window / (update_mask + 1e-8)
+        
+        # Clip update mask to [0, 1]
+        update_mask = torch.clamp(update_mask, 0.0, 1.0)
+        mask_ratio = mask_ratio * update_mask
+        
+        # Apply main convolution
+        x = self.conv(x)
+        
+        # Apply mask ratio
+        x = x * mask_ratio
+        
+        # Add bias if present
+        if self.bias is not None:
+            x = x + self.bias.view(1, -1, 1, 1)
+            # Apply update mask after bias
+            x = x * update_mask
+            
+        return x
 
 class LightConv(nn.Module):
     """
@@ -332,6 +426,19 @@ class Concat(nn.Module):
         """Forward pass for the YOLOv8 mask Proto module."""
         return torch.cat(x, self.d)
 
+class ConcatBiFPN(nn.Module):
+    def __init__(self, dimension=1):
+        super(ConcatBiFPN, self).__init__()
+        self.d = dimension
+        self.w = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
+        self.epsilon = 0.0001
+
+    def forward(self, x):
+        w = self.w
+        weight = w / (torch.sum(w, dim=0) + self.epsilon)  # Normalized weights
+        # Fast normalized fusion
+        x = [weight[0] * x[0], weight[1] * x[1], weight[2] * x[2]]
+        return torch.cat(x, self.d)
 
 class Index(nn.Module):
     """Returns a particular index of the input."""

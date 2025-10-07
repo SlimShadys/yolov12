@@ -1,7 +1,7 @@
 albumentations==2.0.8
 flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 gradio==4.44.1
-huggingface-hub==0.33.1
+huggingface-hub==0.35.1
 numpy==1.26.4
 opencv-python==4.11.0.86
 psutil==5.9.8
